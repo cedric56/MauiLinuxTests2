@@ -1,0 +1,10 @@
+<Shell xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    x:Class="MauiLinuxTests.AppShell"
+    Title="MauiLinuxTests"
+    FlyoutBehavior="Flyout">
+
+    <!-- One entry per tested implementation, added in AppShell.xaml.cs
+         so the pages are created by dependency injection. -->
+
+</Shell>

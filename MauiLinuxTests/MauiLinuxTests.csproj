@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Based on the official template: dotnet new maui-linux-gtk4 (dotnet/maui-labs).
+	     No UseMaui / platform TFMs: the GTK4 backend brings MAUI as plain NuGet packages. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>MauiLinuxTests</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- Display name -->
+    <ApplicationTitle>MauiLinuxTests</ApplicationTitle>
+
+    <!-- App Identifier: also the .desktop file basename used by the portals -->
+    <ApplicationId>com.companyname.mauilinuxtests</ApplicationId>
+
+    <!-- Versions -->
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+
+    <MauiVersion>10.0.120</MauiVersion>
+    <MauiLinuxGtk4Version>0.1.0-preview.14.26531.2</MauiLinuxGtk4Version>
+  </PropertyGroup>
+
+  <!-- Without UseMaui there are no implicit MAUI namespaces. -->
+  <ItemGroup>
+    <Using Include="Microsoft.Maui" />
+    <Using Include="Microsoft.Maui.Controls" />
+    <Using Include="Microsoft.Maui.Graphics" />
+    <Using Include="Microsoft.Maui.Hosting" />
+    <Using Include="Microsoft.Maui.ApplicationModel" />
+  </ItemGroup>
+
+  <!-- Resources\Images, Resources\Fonts and Resources\Raw are included by the GTK4 package,
+	     and Resources\AppIcon\appicon.svg is used as the app icon by default. -->
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Maui.Platforms.Linux.Gtk4" Version="$(MauiLinuxGtk4Version)" />
+    <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
+    <PackageReference Include="Microsoft.Maui.Essentials" Version="$(MauiVersion)" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
+    <PackageReference Include="GirCore.Gtk-4.0" Version="0.7.0" />
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.92.0" />
+  </ItemGroup>
+
+</Project>
