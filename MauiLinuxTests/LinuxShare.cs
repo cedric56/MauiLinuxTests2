@@ -21,9 +21,12 @@ namespace Microsoft.Maui.Platforms.Linux.Gtk4.Essentials.DataTransfer;
 /// (kdialog on KDE, zenity on GNOME/Ubuntu and other desktops):
 /// <list type="bullet">
 /// <item>Email: xdg-desktop-portal Email portal, or xdg-email.</item>
-/// <item>Phones via KDE Connect (<c>kdeconnect-cli</c>) or GSConnect (GNOME Shell, D-Bus).</item>
-/// <item>Paired Bluetooth devices supporting Object Push, via <c>bluedevil-sendfile</c> (KDE)
-/// or <c>bluetooth-sendto</c> (GNOME).</item>
+/// <item>Phones via KDE Connect or GSConnect (GNOME Shell): their own device picker dialogs
+/// (<c>kdeconnect-handler</c>, GSConnect's DeviceChooser) when they support the content,
+/// one entry per device otherwise.</item>
+/// <item>SMS through the phone (KDE Connect, GSConnect) for text, MMS with the files (KDE Connect).</item>
+/// <item>Bluetooth: BlueDevil's send wizard (KDE), or one entry per paired device with
+/// <c>bluetooth-sendto</c> (GNOME).</item>
 /// <item>"Open with…": the xdg-desktop-portal OpenURI application chooser (one link or one file).</item>
 /// </list>
 /// </summary>
@@ -144,12 +147,17 @@ public class LinuxShare : IShare
         };
 
         // Discovery runs in parallel; each source is optional and bounded.
-        var kdeConnect = DiscoverKdeConnectAsync();
-        var gsConnect = DiscoverGSConnectAsync();
+        var kdeConnect = DiscoverKdeConnectAsync(content);
+        var gsConnect = DiscoverGSConnectAsync(content);
         var bluetooth = content.HasFiles ? DiscoverBluetoothAsync() : Task.FromResult<IReadOnlyList<ShareTarget>>(Array.Empty<ShareTarget>());
+
+        var sms = DiscoverSmsAsync(content);
+        var phoneSetup = DiscoverPhoneSetupAsync();
 
         targets.AddRange(await kdeConnect.ConfigureAwait(false));
         targets.AddRange(await gsConnect.ConfigureAwait(false));
+        targets.AddRange(await sms.ConfigureAwait(false));
+        targets.AddRange(await phoneSetup.ConfigureAwait(false));
         targets.AddRange(await bluetooth.ConfigureAwait(false));
 
         // The portal application chooser opens one link or one file.
@@ -159,7 +167,7 @@ public class LinuxShare : IShare
         return targets;
     }
 
-    // ----- Chooser -----
+    // ----- Dialogs (kdialog on KDE, zenity elsewhere) -----
 
     /// <summary>
     /// Asks which target to use, with the desktop's own dialog tool.
@@ -170,65 +178,100 @@ public class LinuxShare : IShare
         if (targets.Count == 1)
             return targets[0];
 
-        // KDE ships kdialog, GNOME/Ubuntu ship zenity; use the other one if missing.
-        var choosers = IsKdeLike
-            ? new[] { "kdialog", "zenity" }
-            : new[] { "zenity", "kdialog" };
+        var choice = await Dialogs.PickAsync(title, "Share with:", targets.Select(t => (t.Id, t.Label)).ToList()).ConfigureAwait(false);
+        if (choice.Cancelled)
+            return null;
 
-        foreach (var chooser in choosers)
+        if (choice.Value is null)
         {
-            if (!Tools.Exists(chooser))
-                continue;
-
-            var args = chooser == "kdialog"
-                ? KdialogMenuArguments(title, targets)
-                : ZenityListArguments(title, targets);
-
-            var result = await Tools.RunAsync(chooser, args, timeout: null).ConfigureAwait(false);
-            if (result is null)
-                continue;
-
-            if (result.ExitCode != 0)
-                return null; // cancelled or closed
-
-            var id = result.Output.Trim();
-            return targets.FirstOrDefault(t => t.Id == id);
+            Debug.WriteLine($"[LinuxShare] no chooser dialog found ({Tools.InstallHint(IsKdeLike ? "kdialog" : "zenity")}), using email");
+            return targets[0];
         }
 
-        Debug.WriteLine($"[LinuxShare] no chooser dialog found ({Tools.InstallHint(IsKdeLike ? "kdialog" : "zenity")}), using email");
-        return targets[0];
+        return targets.FirstOrDefault(t => t.Id == choice.Value);
     }
 
-    static IEnumerable<string> KdialogMenuArguments(string title, IReadOnlyList<ShareTarget> targets)
+    /// <summary>Dialogs shown with the desktop's own tool: kdialog (KDE) or zenity (GNOME/Ubuntu, others).</summary>
+    static class Dialogs
     {
-        yield return "--title";
-        yield return title;
-        yield return "--menu";
-        yield return "Share with:";
-        foreach (var target in targets)
-        {
-            yield return target.Id;
-            yield return target.Label;
-        }
-    }
+        /// <summary>Result: <c>Cancelled</c> when the user closed the dialog, <c>Value</c> null when no dialog tool exists.</summary>
+        public readonly record struct Choice(bool Cancelled, string? Value);
 
-    static IEnumerable<string> ZenityListArguments(string title, IReadOnlyList<ShareTarget> targets)
-    {
-        foreach (var arg in new[]
+        static string[] Order => IsKdeLike ? new[] { "kdialog", "zenity" } : new[] { "zenity", "kdialog" };
+
+        public static async Task<Choice> PickAsync(string title, string prompt, IReadOnlyList<(string Id, string Label)> items)
         {
-            "--list", "--title", title, "--text", "Share with:",
-            "--column", "Id", "--column", "Target",
-            "--hide-column", "1", "--print-column", "1", "--hide-header",
-            "--width", "420", "--height", "360",
-        })
-        {
-            yield return arg;
+            foreach (var tool in Order)
+            {
+                if (!Tools.Exists(tool))
+                    continue;
+
+                var args = new List<string>();
+                if (tool == "kdialog")
+                {
+                    args.AddRange(new[] { "--title", title, "--menu", prompt });
+                }
+                else
+                {
+                    args.AddRange(new[]
+                    {
+                        "--list", "--title", title, "--text", prompt,
+                        "--column", "Id", "--column", "Item",
+                        "--hide-column", "1", "--print-column", "1", "--hide-header",
+                        "--width", "420", "--height", "360",
+                    });
+                }
+
+                foreach (var (id, label) in items)
+                    args.AddRange(new[] { id, label });
+
+                var result = await Tools.RunAsync(tool, args, timeout: null).ConfigureAwait(false);
+                if (result is null)
+                    continue;
+
+                return result.ExitCode != 0 ? new Choice(true, null) : new Choice(false, result.Output.Trim());
+            }
+
+            return new Choice(false, null);
         }
 
-        foreach (var target in targets)
+        public static async Task InfoAsync(string title, string text)
         {
-            yield return target.Id;
-            yield return target.Label;
+            foreach (var tool in Order)
+            {
+                if (!Tools.Exists(tool))
+                    continue;
+
+                var args = tool == "kdialog"
+                    ? new[] { "--title", title, "--msgbox", text }
+                    : new[] { "--info", "--title", title, "--text", text, "--width", "420" };
+
+                if (await Tools.RunAsync(tool, args, timeout: null).ConfigureAwait(false) is not null)
+                    return;
+            }
+
+            Debug.WriteLine($"[LinuxShare] {title}: {text}");
+        }
+
+        public static async Task<Choice> AskTextAsync(string title, string prompt)
+        {
+            foreach (var tool in Order)
+            {
+                if (!Tools.Exists(tool))
+                    continue;
+
+                var args = tool == "kdialog"
+                    ? new[] { "--title", title, "--inputbox", prompt }
+                    : new[] { "--entry", "--title", title, "--text", prompt };
+
+                var result = await Tools.RunAsync(tool, args, timeout: null).ConfigureAwait(false);
+                if (result is null)
+                    continue;
+
+                return result.ExitCode != 0 ? new Choice(true, null) : new Choice(false, result.Output.Trim());
+            }
+
+            return new Choice(false, null);
         }
     }
 
@@ -373,7 +416,7 @@ public class LinuxShare : IShare
     }
 
     // OpenURI(s parent_window, s uri, a{sv} options) -> o handle
-    static MessageBuffer CreateOpenUriMessage(DBusConnection connection, string parentWindow, string token, string uri)
+    static MessageBuffer CreateOpenUriMessage(DBusConnection connection, string parentWindow, string token, string uri, bool ask = true)
     {
         var writer = connection.GetMessageWriter();
         try
@@ -387,7 +430,7 @@ public class LinuxShare : IShare
 
             writer.WriteString(parentWindow);
             writer.WriteString(uri);
-            WriteOpenOptions(ref writer, token);
+            WriteOpenOptions(ref writer, token, ask);
 
             return writer.CreateMessage();
         }
@@ -431,16 +474,16 @@ public class LinuxShare : IShare
         }
     }
 
-    static void WriteOpenOptions(ref MessageWriter writer, string token)
+    static void WriteOpenOptions(ref MessageWriter writer, string token, bool ask = true)
     {
         var options = writer.WriteDictionaryStart();
         WriteStringOption(ref writer, "handle_token", token);
         WriteStringOption(ref writer, "activation_token", Environment.GetEnvironmentVariable("XDG_ACTIVATION_TOKEN"));
 
-        // Always show the application chooser.
+        // "Open with…": always show the application chooser.
         writer.WriteDictionaryEntryStart();
         writer.WriteString("ask");
-        writer.WriteVariantBool(true);
+        writer.WriteVariantBool(ask);
 
         writer.WriteDictionaryEnd(options);
     }
@@ -455,30 +498,66 @@ public class LinuxShare : IShare
         writer.WriteVariantString(value);
     }
 
-    // ----- KDE Connect (kdeconnect-cli) -----
+    // ----- KDE Connect -----
 
-    static async Task<IReadOnlyList<ShareTarget>> DiscoverKdeConnectAsync()
+    /// <summary>
+    /// Files and links: one "KDE Connect" entry opening <c>kdeconnect-handler</c>, KDE Connect's own
+    /// dialog to pick the device. Text: the handler only takes URLs, so one entry per reachable
+    /// device, sent with <c>kdeconnect-cli --share-text</c>.
+    /// </summary>
+    static async Task<IReadOnlyList<ShareTarget>> DiscoverKdeConnectAsync(ShareContent content)
+    {
+        var devices = await ListKdeConnectDevicesAsync().ConfigureAwait(false);
+        var usesHandler = (content.HasFiles || content.IsLinkOnly) && Tools.Exists("kdeconnect-handler");
+
+        // The handler lists the paired and reachable devices itself; without kdeconnect-cli we
+        // can't tell whether there is one, so the entry is offered anyway.
+        if (usesHandler && (devices is null || devices.Count > 0))
+            return new[] { new ShareTarget("kdeconnect", "Phone… (KDE Connect)", ShareWithKdeConnectHandlerAsync) };
+
+        return (devices ?? new List<(string Id, string Name)>())
+            .Select(d => new ShareTarget(
+                "kdeconnect:" + d.Id,
+                $"{d.Name} (KDE Connect)",
+                c => ShareWithKdeConnectCliAsync(d.Id, c)))
+            .ToList();
+    }
+
+    /// <summary>Paired and reachable devices, or null when kdeconnect-cli isn't installed.</summary>
+    static async Task<List<(string Id, string Name)>?> ListKdeConnectDevicesAsync()
     {
         if (!Tools.Exists("kdeconnect-cli"))
-            return Array.Empty<ShareTarget>();
+            return null;
 
         // One "<id> <name>" line per paired and reachable device.
         var result = await Tools.RunAsync("kdeconnect-cli", new[] { "--list-available", "--id-name-only" }, s_discoveryTimeout).ConfigureAwait(false);
         if (result is null || result.ExitCode != 0)
-            return Array.Empty<ShareTarget>();
+            return new List<(string Id, string Name)>();
 
         return result.Output
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(line => line.Split(' ', 2))
             .Where(parts => parts.Length == 2)
-            .Select(parts => new ShareTarget(
-                "kdeconnect:" + parts[0],
-                $"{parts[1]} (KDE Connect)",
-                content => ShareWithKdeConnectAsync(parts[0], content)))
+            .Select(parts => (parts[0], parts[1]))
             .ToList();
     }
 
-    static async Task ShareWithKdeConnectAsync(string deviceId, ShareContent content)
+    // kdeconnect-handler <url>...: device picker dialog; exits 1 when cancelled.
+    static async Task ShareWithKdeConnectHandlerAsync(ShareContent content)
+    {
+        var args = content.HasFiles
+            ? content.Files.Select(Path.GetFullPath).ToList()
+            : new List<string> { content.Uri! };
+
+        var result = await Tools.RunAsync("kdeconnect-handler", args, timeout: null).ConfigureAwait(false)
+            ?? throw new FeatureNotSupportedException("kdeconnect-handler is not available.");
+
+        // Exit code 1 is also "dialog cancelled": like the other platforms, not an error.
+        if (result.ExitCode is not (0 or 1))
+            result.ThrowIfFailed("kdeconnect-handler");
+    }
+
+    static async Task ShareWithKdeConnectCliAsync(string deviceId, ShareContent content)
     {
         var args = new List<string> { "--device", deviceId };
 
@@ -505,25 +584,79 @@ public class LinuxShare : IShare
 
     // ----- GSConnect (GNOME Shell implementation of KDE Connect, D-Bus) -----
 
-    static async Task<IReadOnlyList<ShareTarget>> DiscoverGSConnectAsync()
+    /// <summary>
+    /// Files: one "GSConnect" entry opening GSConnect's own device chooser dialog
+    /// (<c>org.freedesktop.Application.Open</c> with file URIs). Links and text: the chooser only
+    /// takes files, so one entry per connected device, sent through its actions.
+    /// </summary>
+    static async Task<IReadOnlyList<ShareTarget>> DiscoverGSConnectAsync(ShareContent content)
     {
         if (!XdgDesktopPortal.IsSessionBusAvailable)
             return Array.Empty<ShareTarget>();
 
         // NoAutoStart: only use GSConnect if it is already running.
-        var objects = await DBusObjects.GetManagedObjectsAsync(
-            DBusConnection.Session, GSConnectBusName, GSConnectObjectPath, GSConnectDeviceInterface, s_discoveryTimeout).ConfigureAwait(false);
-
-        return objects
+        var devices = (await DBusObjects.GetManagedObjectsAsync(
+                DBusConnection.Session, GSConnectBusName, GSConnectObjectPath, GSConnectDeviceInterface, s_discoveryTimeout).ConfigureAwait(false))
             .Where(o => o.Properties.GetBool("Connected") && o.Properties.GetBool("Paired"))
+            .ToList();
+
+        if (devices.Count == 0)
+            return Array.Empty<ShareTarget>();
+
+        if (content.HasFiles)
+            return new[] { new ShareTarget("gsconnect", "Phone… (GSConnect)", OpenGSConnectChooserAsync) };
+
+        return devices
             .Select(o => new ShareTarget(
                 "gsconnect:" + o.Path,
                 $"{o.Properties.GetString("Name") ?? "Device"} (GSConnect)",
-                content => ShareWithGSConnectAsync(o.Path, content)))
+                c => ShareWithGSConnectAsync(o.Path, c)))
             .ToList();
     }
 
-    static async Task ShareWithGSConnectAsync(string devicePath, ShareContent content)
+    // org.freedesktop.Application.Open(as uris, s hint, a{sv} platform_data):
+    // GSConnect shows its DeviceChooser for every file:// URI.
+    static Task OpenGSConnectChooserAsync(ShareContent content)
+    {
+        var connection = DBusConnection.Session;
+        var uris = content.Files.Select(f => new Uri(Path.GetFullPath(f)).AbsoluteUri).ToArray();
+        return connection.CallMethodAsync(CreateOpenMessage(connection, GSConnectBusName, GSConnectObjectPath, uris));
+    }
+
+    static MessageBuffer CreateOpenMessage(DBusConnection connection, string busName, string path, string[] uris)
+    {
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(
+            destination: busName,
+            path: path,
+            @interface: "org.freedesktop.Application",
+            member: "Open",
+            signature: "assa{sv}");
+
+        var array = writer.WriteArrayStart(DBusType.String);
+        foreach (var uri in uris)
+            writer.WriteString(uri);
+        writer.WriteArrayEnd(array);
+
+        writer.WriteString(string.Empty); // hint
+
+        var platformData = writer.WriteDictionaryStart();
+        if (Environment.GetEnvironmentVariable("XDG_ACTIVATION_TOKEN") is { Length: > 0 } token)
+        {
+            writer.WriteDictionaryEntryStart();
+            writer.WriteString("activation-token");
+            writer.WriteVariantString(token);
+        }
+        writer.WriteDictionaryEnd(platformData);
+
+        return writer.CreateMessage();
+    }
+
+    static async Task ShareWithGSConnectAsync(string devicePath, ShareContent content) =>
+        await ShareWithGSConnectAsync(devicePath, content, textAction: null).ConfigureAwait(false);
+
+    /// <param name="textAction">Action used for text (and links): shareText/shareUri by default, shareSms for SMS.</param>
+    static async Task ShareWithGSConnectAsync(string devicePath, ShareContent content, string? textAction)
     {
         var connection = DBusConnection.Session;
 
@@ -531,6 +664,10 @@ public class LinuxShare : IShare
         {
             foreach (var file in content.Files)
                 await ActivateAsync("shareFile", Path.GetFullPath(file)).ConfigureAwait(false);
+        }
+        else if (textAction is not null)
+        {
+            await ActivateAsync(textAction, content.Body!).ConfigureAwait(false);
         }
         else if (content.IsLinkOnly)
         {
@@ -579,23 +716,502 @@ public class LinuxShare : IShare
         return writer.CreateMessage();
     }
 
+    // ----- Phone link setup (KDE Connect / GSConnect not installed) -----
+
+    const string GSConnectUuid = "gsconnect@andyholmes.github.io";
+    const string ShellExtensionsBusName = "org.gnome.Shell.Extensions";
+    const string ShellExtensionsPath = "/org/gnome/Shell/Extensions";
+    const string KdeConnectAppStreamId = "org.kde.kdeconnect";
+
+    // GNOME Shell extension state ACTIVE (js/misc/extensionUtils.js ExtensionState), serialized as a double.
+    const double ExtensionStateEnabled = 1;
+
+    static bool IsGnomeShell =>
+        (Environment.GetEnvironmentVariable("XDG_CURRENT_DESKTOP") ?? string.Empty)
+            .Split(':').Any(d => d.Equals("GNOME", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Offered at every opening of the share dialog as long as no phone can be used:
+    /// <list type="bullet">
+    /// <item>nothing installed: install GSConnect on GNOME Shell (GNOME Shell's own dialog),
+    /// KDE Connect elsewhere (software center: Discover, GNOME Software...);</item>
+    /// <item>GSConnect installed but inactive: enable it;</item>
+    /// <item>installed but no paired phone reachable: open the pairing UI
+    /// (KDE Connect app, GSConnect preferences).</item>
+    /// </list>
+    /// Nothing is remembered between openings: the entry disappears once a phone is available.
+    /// </summary>
+    async Task<IReadOnlyList<ShareTarget>> DiscoverPhoneSetupAsync()
+    {
+        if (IsKdeConnectInstalled())
+        {
+            // Unknown without kdeconnect-cli: the handler's own dialog then shows the devices.
+            var devices = await ListKdeConnectDevicesAsync().ConfigureAwait(false);
+            if (devices is not null && devices.Count == 0 && Tools.Exists("kdeconnect-app"))
+                return new[] { new ShareTarget("setup:kdeconnect-pair", "Pair a phone with KDE Connect…", _ => OpenKdeConnectPairingAsync()) };
+
+            return Array.Empty<ShareTarget>();
+        }
+
+        if (IsGnomeShell && XdgDesktopPortal.IsSessionBusAvailable)
+        {
+            var state = await GetExtensionStateAsync(GSConnectUuid).ConfigureAwait(false);
+            if (state == ExtensionStateEnabled)
+            {
+                var devices = await DBusObjects.GetManagedObjectsAsync(
+                    DBusConnection.Session, GSConnectBusName, GSConnectObjectPath, GSConnectDeviceInterface, s_discoveryTimeout).ConfigureAwait(false);
+
+                return devices.Any(o => o.Properties.GetBool("Connected") && o.Properties.GetBool("Paired"))
+                    ? Array.Empty<ShareTarget>()
+                    : new[] { new ShareTarget("setup:gsconnect-pair", "Pair a phone with GSConnect…", _ => OpenGSConnectPairingAsync()) };
+            }
+
+            if (state is not null)
+                return new[] { new ShareTarget("setup:gsconnect-enable", "Enable GSConnect to share with your phone…", _ => EnableGSConnectAsync()) };
+
+            return new[] { new ShareTarget("setup:gsconnect", "Install GSConnect to share with your phone…", _ => InstallGSConnectAsync()) };
+        }
+
+        return new[] { new ShareTarget("setup:kdeconnect", "Install KDE Connect to share with your phone…", _ => InstallKdeConnectAsync()) };
+    }
+
+    // The KDE Connect app lists the nearby devices and pairs them.
+    static async Task OpenKdeConnectPairingAsync()
+    {
+        if (!Tools.Start("kdeconnect-app", Array.Empty<string>()))
+            throw new FeatureNotSupportedException("kdeconnect-app is not available.");
+
+        await ShowPairingHelpAsync("KDE Connect").ConfigureAwait(false);
+    }
+
+    // GSConnect's preferences window lists the nearby devices and pairs them.
+    static async Task OpenGSConnectPairingAsync()
+    {
+        var connection = DBusConnection.Session;
+        await connection.CallMethodAsync(CreateOpenExtensionPrefsMessage(connection, GSConnectUuid)).ConfigureAwait(false);
+        await ShowPairingHelpAsync("GSConnect").ConfigureAwait(false);
+    }
+
+    // OpenExtensionPrefs(s uuid, s parent_window, a{sv} options)
+    static MessageBuffer CreateOpenExtensionPrefsMessage(DBusConnection connection, string uuid)
+    {
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(
+            destination: ShellExtensionsBusName,
+            path: ShellExtensionsPath,
+            @interface: "org.gnome.Shell.Extensions",
+            member: "OpenExtensionPrefs",
+            signature: "ssa{sv}");
+        writer.WriteString(uuid);
+        writer.WriteString(string.Empty);
+        var options = writer.WriteDictionaryStart();
+        writer.WriteDictionaryEnd(options);
+        return writer.CreateMessage();
+    }
+
+    static bool IsKdeConnectInstalled() =>
+        Tools.Exists("kdeconnect-cli") || Tools.Exists("kdeconnect-app") || Tools.Exists("kdeconnect-handler");
+
+    /// <summary>GNOME Shell extension state, or null when the extension isn't installed.</summary>
+    static async Task<double?> GetExtensionStateAsync(string uuid)
+    {
+        try
+        {
+            var connection = DBusConnection.Session;
+            var info = await connection.CallMethodAsync(
+                CreateShellExtensionsMessage(connection, "GetExtensionInfo", uuid),
+                static (Message m, object? state) => m.GetBodyReader().ReadDictionaryOfStringToVariantValue())
+                .WaitAsync(s_discoveryTimeout).ConfigureAwait(false);
+
+            if (info.Count == 0)
+                return null;
+
+            return info.TryGetValue("state", out var value) && value.Type == VariantValueType.Double ? value.GetDouble() : 0;
+        }
+        catch (Exception ex) when (ex is DBusExceptionBase or TimeoutException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// GNOME Shell downloads the extension from extensions.gnome.org after its own confirmation dialog.
+    /// </summary>
+    static async Task InstallGSConnectAsync()
+    {
+        var connection = DBusConnection.Session;
+        var result = await connection.CallMethodAsync(
+            CreateShellExtensionsMessage(connection, "InstallRemoteExtension", GSConnectUuid),
+            static (Message m, object? state) => m.GetBodyReader().ReadString()).ConfigureAwait(false);
+
+        if (result != "successful")
+            return; // cancelled in GNOME Shell's dialog
+
+        await OpenGSConnectPairingAsync().ConfigureAwait(false);
+    }
+
+    static async Task EnableGSConnectAsync()
+    {
+        var connection = DBusConnection.Session;
+        var enabled = await connection.CallMethodAsync(
+            CreateShellExtensionsMessage(connection, "EnableExtension", GSConnectUuid),
+            static (Message m, object? state) => m.GetBodyReader().ReadBool()).ConfigureAwait(false);
+
+        if (!enabled)
+            throw new InvalidOperationException("GNOME Shell could not enable GSConnect.");
+
+        await OpenGSConnectPairingAsync().ConfigureAwait(false);
+    }
+
+    static MessageBuffer CreateShellExtensionsMessage(DBusConnection connection, string method, string uuid)
+    {
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(
+            destination: ShellExtensionsBusName,
+            path: ShellExtensionsPath,
+            @interface: "org.gnome.Shell.Extensions",
+            member: method,
+            signature: "s");
+        writer.WriteString(uuid);
+        return writer.CreateMessage();
+    }
+
+    /// <summary>
+    /// Opens KDE Connect's page in the software center (<c>appstream://</c>, handled by Discover and
+    /// GNOME Software) through the OpenURI portal; shows the install command when none is installed.
+    /// </summary>
+    async Task InstallKdeConnectAsync()
+    {
+        uint? response = null;
+        if (XdgDesktopPortal.IsSessionBusAvailable)
+        {
+            try
+            {
+                var token = XdgDesktopPortal.NewHandleToken();
+                var parentWindow = _parentWindow?.Invoke() ?? string.Empty;
+                response = await XdgDesktopPortal.RequestAsync(
+                    token,
+                    connection => CreateOpenUriMessage(connection, parentWindow, token, $"appstream://{KdeConnectAppStreamId}", ask: false),
+                    s_openWithResponseTimeout).ConfigureAwait(false);
+            }
+            catch (DBusErrorReplyException ex)
+            {
+                Debug.WriteLine($"[LinuxShare] no software center for appstream:// ({ex.Message})");
+            }
+        }
+
+        if (response is null or XdgDesktopPortal.ResponseOther)
+        {
+            await Dialogs.InfoAsync("KDE Connect",
+                "Install KDE Connect with your software center, or in a terminal:\n\n" +
+                Tools.InstallHint(KdeConnectPackageName()) +
+                "\n\nThen install KDE Connect on your phone and pair it.").ConfigureAwait(false);
+            return;
+        }
+
+        await ShowPairingHelpAsync("KDE Connect").ConfigureAwait(false);
+    }
+
+    static string KdeConnectPackageName()
+    {
+        var distribution = DistributionImplementation.Current;
+        if (distribution == Distribution.Fedora || distribution == Distribution.RHEL ||
+            distribution == Distribution.CentOS || distribution == Distribution.RockyLinux ||
+            distribution == Distribution.AlmaLinux)
+            return "kde-connect";
+
+        if (distribution == Distribution.OpenSUSE)
+            return "kdeconnect-kde";
+
+        return "kdeconnect";
+    }
+
+    static Task ShowPairingHelpAsync(string app) =>
+        Dialogs.InfoAsync(app,
+            $"Install the KDE Connect app on your phone (Google Play, F-Droid or the App Store), " +
+            $"connect both devices to the same network, then pair them from {app}. " +
+            $"Your phone will then be offered when sharing.");
+
+    // ----- SMS / MMS through the phone (KDE Connect, GSConnect) -----
+
+    const string KdeConnectBusName = "org.kde.kdeconnect";
+    const string KdeConnectConversationsInterface = "org.kde.kdeconnect.device.conversations";
+
+    /// <summary>
+    /// <list type="bullet">
+    /// <item>Text or link: "SMS…" opens the phone's messaging UI with the message filled in:
+    /// the KDE Connect SMS app (<c>kdeconnect-sms --message</c>) or GSConnect's conversation chooser
+    /// (<c>shareSms</c> action). The user picks the conversation there.</item>
+    /// <item>Files, automatic (KDE Connect): "MMS…" asks for the recipient (contacts synced by
+    /// KDE Connect, or a number) and sends the files with <c>sendWithoutConversation</c>.</item>
+    /// <item>Files, manual (KDE Connect): "SMS app (attach the files)" opens the SMS app; its
+    /// attach button has to be used, files can't be passed to it.</item>
+    /// </list>
+    /// </summary>
+    static async Task<IReadOnlyList<ShareTarget>> DiscoverSmsAsync(ShareContent content)
+    {
+        var targets = new List<ShareTarget>();
+
+        var kdeDevices = await ListKdeConnectSmsDevicesAsync().ConfigureAwait(false);
+        var hasSmsApp = Tools.Exists("kdeconnect-sms");
+
+        foreach (var device in kdeDevices)
+        {
+            var suffix = kdeDevices.Count > 1 ? $" via {device.Name}" : string.Empty;
+
+            // The phone doesn't expose SMS (plugin disabled or SMS permission not granted in the
+            // KDE Connect app): still offered, so the user learns how to enable it.
+            if (!device.SmsReady)
+            {
+                targets.Add(new($"sms-setup:{device.Id}", $"{(content.HasFiles ? "MMS" : "SMS")}…{suffix} (KDE Connect, enable SMS on the phone)",
+                    _ => Dialogs.InfoAsync("KDE Connect",
+                        $"{device.Name} doesn't allow sending SMS yet. In the KDE Connect app on the phone, open the " +
+                        "plugin settings, enable \"SMS\" and grant the SMS and contacts permissions; " +
+                        "also check that the SMS plugin is enabled for the phone in KDE Connect on this computer.")));
+                continue;
+            }
+
+            if (content.HasFiles)
+            {
+                targets.Add(new($"mms:{device.Id}", $"MMS…{suffix} (KDE Connect)",
+                    c => SendMmsWithKdeConnectAsync(device.Id, device.Name, c)));
+
+                if (hasSmsApp)
+                    targets.Add(new($"smsapp:{device.Id}", $"SMS app, attach the files yourself{suffix} (KDE Connect)",
+                        c => OpenKdeConnectSmsAppAsync(device.Id, c.Body ?? string.Empty)));
+            }
+            else if (hasSmsApp)
+            {
+                targets.Add(new($"sms:{device.Id}", $"SMS…{suffix} (KDE Connect)",
+                    c => OpenKdeConnectSmsAppAsync(device.Id, c.Body!)));
+            }
+        }
+
+        // GSConnect: text only.
+        if (!content.HasFiles && XdgDesktopPortal.IsSessionBusAvailable)
+        {
+            var devices = (await DBusObjects.GetManagedObjectsAsync(
+                    DBusConnection.Session, GSConnectBusName, GSConnectObjectPath, GSConnectDeviceInterface, s_discoveryTimeout).ConfigureAwait(false))
+                .Where(o => o.Properties.GetBool("Connected") && o.Properties.GetBool("Paired"))
+                .ToList();
+
+            foreach (var device in devices)
+            {
+                var name = device.Properties.GetString("Name") ?? "Device";
+                var suffix = devices.Count > 1 ? $" via {name}" : string.Empty;
+                targets.Add(new($"gsms:{device.Path}", $"SMS…{suffix} (GSConnect)",
+                    c => ShareWithGSConnectAsync(device.Path, c, "shareSms")));
+            }
+        }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Reachable KDE Connect devices, and whether their SMS plugin is loaded. It is loaded only
+    /// when enabled on both sides and the phone app has the SMS permission.
+    /// </summary>
+    static async Task<List<(string Id, string Name, bool SmsReady)>> ListKdeConnectSmsDevicesAsync()
+    {
+        var devices = await ListKdeConnectDevicesAsync().ConfigureAwait(false);
+        if (devices is null || devices.Count == 0 || !XdgDesktopPortal.IsSessionBusAvailable)
+            return new List<(string Id, string Name, bool SmsReady)>();
+
+        var result = new List<(string Id, string Name, bool SmsReady)>();
+        foreach (var device in devices)
+        {
+            bool? hasSms = null;
+            try
+            {
+                var connection = DBusConnection.Session;
+                hasSms = await connection.CallMethodAsync(
+                    CreateHasPluginMessage(connection, device.Id, "kdeconnect_sms"),
+                    static (Message m, object? state) => m.GetBodyReader().ReadBool()).WaitAsync(s_discoveryTimeout).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is DBusExceptionBase or TimeoutException)
+            {
+                // Unknown (older daemon, slow bus): offer SMS, the daemon reports a failure if needed.
+                Debug.WriteLine($"[LinuxShare] hasPlugin(kdeconnect_sms) failed for {device.Id}: {ex.Message}");
+            }
+
+            result.Add((device.Id, device.Name, hasSms != false));
+        }
+
+        return result;
+    }
+
+    // org.kde.kdeconnect.device.hasPlugin(s name) -> b
+    static MessageBuffer CreateHasPluginMessage(DBusConnection connection, string deviceId, string plugin)
+    {
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(
+            destination: KdeConnectBusName,
+            path: $"/modules/kdeconnect/devices/{deviceId}",
+            @interface: "org.kde.kdeconnect.device",
+            member: "hasPlugin",
+            signature: "s");
+        writer.WriteString(plugin);
+        return writer.CreateMessage();
+    }
+
+    static async Task OpenKdeConnectSmsAppAsync(string deviceId, string message)
+    {
+        var args = new List<string> { "--device", deviceId };
+        if (message.Length > 0)
+            args.AddRange(new[] { "--message", message });
+
+        // The SMS app is a regular window: don't wait for it to be closed.
+        if (!Tools.Start("kdeconnect-sms", args))
+            throw new FeatureNotSupportedException("kdeconnect-sms is not available.");
+
+        await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks for the recipient, then sends the files (and text) as an MMS through the phone.
+    /// </summary>
+    static async Task SendMmsWithKdeConnectAsync(string deviceId, string deviceName, ShareContent content)
+    {
+        var contacts = ReadKdeConnectContacts(deviceId);
+
+        string? number;
+        if (contacts.Count > 0)
+        {
+            var items = new List<(string Id, string Label)> { ("manual", "Enter a phone number…") };
+            items.AddRange(contacts.Select((c, i) => ($"contact:{i}", $"{c.Name} — {c.Number}")));
+
+            var choice = await Dialogs.PickAsync("MMS", $"Recipient (contacts of {deviceName}):", items).ConfigureAwait(false);
+            if (choice.Cancelled)
+                return;
+
+            number = choice.Value is { } id && id.StartsWith("contact:", StringComparison.Ordinal)
+                ? contacts[int.Parse(id["contact:".Length..], System.Globalization.CultureInfo.InvariantCulture)].Number
+                : null;
+        }
+        else
+        {
+            number = null;
+        }
+
+        if (number is null)
+        {
+            var input = await Dialogs.AskTextAsync("MMS", "Recipient phone number(s), separated by spaces:").ConfigureAwait(false);
+            if (input.Cancelled)
+                return;
+
+            number = input.Value;
+        }
+
+        var addresses = (number ?? string.Empty).Split(new[] { ' ', ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
+        if (addresses.Length == 0)
+            throw new InvalidOperationException("No recipient phone number was given.");
+
+        var connection = DBusConnection.Session;
+        await connection.CallMethodAsync(CreateSendMmsMessage(
+            connection, deviceId, addresses, content.Body ?? string.Empty, content.Files.Select(Path.GetFullPath).ToList())).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// org.kde.kdeconnect.device.conversations.sendWithoutConversation(av addresses, s message, av attachmentUrls):
+    /// each address is a variant holding a <c>(s)</c> struct (ConversationAddress), each attachment
+    /// a variant holding the local file path, read and base64-encoded by the daemon.
+    /// </summary>
+    static MessageBuffer CreateSendMmsMessage(DBusConnection connection, string deviceId, IReadOnlyList<string> addresses, string message, IReadOnlyList<string> files)
+    {
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(
+            destination: KdeConnectBusName,
+            path: $"/modules/kdeconnect/devices/{deviceId}",
+            @interface: KdeConnectConversationsInterface,
+            member: "sendWithoutConversation",
+            signature: "avsav");
+
+        var addressArray = writer.WriteArrayStart(DBusType.Variant);
+        foreach (var address in addresses)
+        {
+            writer.WriteSignature("(s)");
+            writer.WriteStructureStart();
+            writer.WriteString(address);
+        }
+        writer.WriteArrayEnd(addressArray);
+
+        writer.WriteString(message);
+
+        var fileArray = writer.WriteArrayStart(DBusType.Variant);
+        foreach (var file in files)
+            writer.WriteVariantString(file);
+        writer.WriteArrayEnd(fileArray);
+
+        return writer.CreateMessage();
+    }
+
+    /// <summary>
+    /// Contacts synced by KDE Connect's contacts plugin:
+    /// <c>~/.local/share/kpeoplevcard/kdeconnect-&lt;device id&gt;/*.vcf</c>.
+    /// </summary>
+    static List<(string Name, string Number)> ReadKdeConnectContacts(string deviceId)
+    {
+        var dataHome = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+        if (string.IsNullOrWhiteSpace(dataHome) || !Path.IsPathRooted(dataHome))
+            dataHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
+
+        var directory = Path.Combine(dataHome, "kpeoplevcard", "kdeconnect-" + deviceId);
+        var contacts = new List<(string Name, string Number)>();
+        if (!Directory.Exists(directory))
+            return contacts;
+
+        foreach (var file in Directory.EnumerateFiles(directory, "*.vcf"))
+        {
+            try
+            {
+                string? name = null;
+                var numbers = new List<string>();
+                foreach (var line in File.ReadLines(file))
+                {
+                    var colon = line.IndexOf(':');
+                    if (colon <= 0)
+                        continue;
+
+                    var key = line[..colon];
+                    var value = line[(colon + 1)..].Trim();
+                    if (key == "FN" || key.StartsWith("FN;", StringComparison.Ordinal))
+                        name = value.Replace("\\,", ",");
+                    else if ((key == "TEL" || key.StartsWith("TEL;", StringComparison.Ordinal)) && value.Length > 0)
+                        numbers.Add(value);
+                }
+
+                foreach (var number in numbers.Distinct())
+                    contacts.Add((name ?? number, number));
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        return contacts.OrderBy(c => c.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+    }
+
     // ----- Bluetooth (BlueZ + bluedevil-sendfile / bluetooth-sendto) -----
 
+    /// <summary>
+    /// KDE: one "Bluetooth" entry opening BlueDevil's send wizard, which has its own device page.
+    /// GNOME: <c>bluetooth-sendto</c> requires the device, so one entry per paired device
+    /// able to receive files (OBEX Object Push), read from BlueZ.
+    /// </summary>
     static async Task<IReadOnlyList<ShareTarget>> DiscoverBluetoothAsync()
     {
-        // KDE: BlueDevil's wizard; GNOME/Ubuntu: gnome-bluetooth's sender. Either one works anywhere.
-        var senders = IsKdeLike
-            ? new[] { "bluedevil-sendfile", "bluetooth-sendto" }
-            : new[] { "bluetooth-sendto", "bluedevil-sendfile" };
+        var hasWizard = Tools.Exists("bluedevil-sendfile");
+        var hasSendTo = Tools.Exists("bluetooth-sendto");
 
-        var sender = senders.FirstOrDefault(Tools.Exists);
-        if (sender is null || DBusAddress.System is null)
+        if (hasWizard && (IsKdeLike || !hasSendTo))
+            return new[] { new ShareTarget("bluetooth", "Bluetooth…", SendWithBluetoothWizardAsync) };
+
+        if (!hasSendTo || DBusAddress.System is null)
             return Array.Empty<ShareTarget>();
 
         var devices = await DBusObjects.GetManagedObjectsAsync(
             DBusConnection.System, BluezBusName, "/", BluezDeviceInterface, s_discoveryTimeout).ConfigureAwait(false);
 
-        // Paired devices able to receive files (OBEX Object Push).
         return devices
             .Where(d => d.Properties.GetBool("Paired")
                      && d.Properties.GetStrings("UUIDs").Contains(ObexObjectPushUuid, StringComparer.OrdinalIgnoreCase))
@@ -604,8 +1220,21 @@ public class LinuxShare : IShare
             .Select(d => new ShareTarget(
                 "bluetooth:" + d.Address,
                 $"{d.Name ?? d.Address} (Bluetooth)",
-                content => SendWithBluetoothAsync(sender, d.Address!, d.Name, content)))
+                content => SendWithBluetoothAsync("bluetooth-sendto", d.Address!, d.Name, content)))
             .ToList();
+    }
+
+    // bluedevil-sendfile -f <file>...: without --kio/--ubi, the wizard starts on its device page.
+    static async Task SendWithBluetoothWizardAsync(ShareContent content)
+    {
+        var args = new List<string>();
+        foreach (var file in content.Files)
+            args.AddRange(new[] { "--files", Path.GetFullPath(file) });
+
+        var result = await Tools.RunAsync("bluedevil-sendfile", args, timeout: null).ConfigureAwait(false)
+            ?? throw new FeatureNotSupportedException("bluedevil-sendfile is not available.");
+
+        result.ThrowIfFailed("bluedevil-sendfile");
     }
 
     static async Task SendWithBluetoothAsync(string sender, string address, string? name, ShareContent content)
@@ -718,6 +1347,24 @@ public class LinuxShare : IShare
 
             return path.Split(':', StringSplitOptions.RemoveEmptyEntries)
                 .Any(dir => File.Exists(Path.Combine(dir, tool)));
+        }
+
+        /// <summary>Starts a tool without waiting for it. Returns false when it isn't installed.</summary>
+        public static bool Start(string tool, IEnumerable<string> args)
+        {
+            var psi = new ProcessStartInfo(tool) { UseShellExecute = false };
+            foreach (var arg in args)
+                psi.ArgumentList.Add(arg);
+
+            try
+            {
+                using var process = Process.Start(psi);
+                return process is not null;
+            }
+            catch (Win32Exception)
+            {
+                return false;
+            }
         }
 
         /// <summary>
